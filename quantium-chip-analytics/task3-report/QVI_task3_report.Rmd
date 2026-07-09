@@ -1,0 +1,479 @@
+---
+title: |
+  ![](header_blank.png){width=0px}
+  Chip Category — Strategic Review
+subtitle: |
+  Insights & Recommendations for Julia Chen, Category Manager
+  \vspace{0.5cm}
+  \large Quantium Retail Analytics · July 2026
+date: ""
+author: ""
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: false
+    number_sections: false
+    includes:
+      in_header: report_header.tex
+geometry: "margin=2cm"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 3.8,
+                      fig.align = "center")
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readxl)
+  library(lubridate)
+  library(scales)
+  library(gridExtra)
+  library(grid)
+  library(patchwork)
+})
+
+# ── Colour palette (consistent across all charts) ──────────────────────────
+COL_RED    <- "#C0392B"   # trial / accent
+COL_BLUE   <- "#2980B9"   # control / primary
+COL_ORANGE <- "#E67E22"   # secondary highlight
+COL_GREY   <- "#7F8C8D"   # muted
+COL_BG     <- "#F8F9FA"
+
+TIER_COLS  <- c(Budget = "#2980B9", Mainstream = "#E67E22", Premium = "#C0392B")
+
+theme_qvi <- function() {
+  theme_minimal(base_size = 10) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 11, colour = "#2C3E50"),
+      plot.subtitle    = element_text(size = 9,  colour = "#7F8C8D"),
+      plot.background  = element_rect(fill = COL_BG, colour = NA),
+      panel.background = element_rect(fill = COL_BG, colour = NA),
+      panel.grid.major = element_line(colour = "#ECF0F1"),
+      panel.grid.minor = element_blank(),
+      axis.text        = element_text(colour = "#555555"),
+      legend.position  = "top",
+      legend.title     = element_blank(),
+      strip.text       = element_text(face = "bold", size = 9)
+    )
+}
+```
+
+```{r data-prep, include=FALSE}
+# ── Rebuild cleaned dataset ─────────────────────────────────────────────────
+txn <- read_excel("~/Downloads/QVI_transaction_data.xlsx") %>%
+  mutate(DATE = as.Date(DATE, origin = "1899-12-30")) %>%
+  filter(!str_detect(str_to_lower(PROD_NAME), "salsa")) %>%
+  distinct()
+
+suspect_cards <- txn %>% filter(PROD_QTY > 200) %>% pull(LYLTY_CARD_NBR) %>% unique()
+txn <- txn %>% filter(!LYLTY_CARD_NBR %in% suspect_cards) %>%
+  mutate(
+    PACK_SIZE = as.numeric(str_extract(PROD_NAME, "[0-9]+(?=g)")),
+    BRAND = recode(str_to_upper(word(PROD_NAME, 1)),
+      RED="RRD", SNBTS="SUNBITES", INFZNS="INFUZIONS",
+      DORITO="DORITOS", GRAIN="GRNWVES", SMITH="SMITHS",
+      NCC="NATURAL", WW="WOOLWORTHS")
+  )
+
+pb <- read_csv("~/Downloads/QVI_purchase_behaviour.csv", show_col_types = FALSE)
+df <- txn %>% left_join(pb, by = "LYLTY_CARD_NBR") %>% drop_na(LIFESTAGE, PREMIUM_CUSTOMER)
+
+# ── Segment metrics ─────────────────────────────────────────────────────────
+seg <- df %>%
+  group_by(LIFESTAGE, PREMIUM_CUSTOMER) %>%
+  summarise(
+    TOTAL_SALES   = sum(TOT_SALES),
+    N_CUSTOMERS   = n_distinct(LYLTY_CARD_NBR),
+    N_TXN         = n(),
+    TOTAL_UNITS   = sum(PROD_QTY),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    AVG_SPEND_PER_CUST = TOTAL_SALES / N_CUSTOMERS,
+    AVG_PRICE_PER_UNIT = TOTAL_SALES / TOTAL_UNITS,
+    AVG_TXN_PER_CUST   = N_TXN / N_CUSTOMERS,
+    PREMIUM_CUSTOMER   = factor(PREMIUM_CUSTOMER, levels = c("Budget","Mainstream","Premium"))
+  )
+
+# ── Monthly store metrics ───────────────────────────────────────────────────
+monthly <- df %>%
+  mutate(MONTH_YR = floor_date(DATE, "month")) %>%
+  group_by(STORE_NBR, MONTH_YR) %>%
+  summarise(TOT_SALES=sum(TOT_SALES), N_CUST=n_distinct(LYLTY_CARD_NBR),
+            N_TXN=n(), .groups="drop") %>%
+  mutate(AVG_TXN_PER_CUST = N_TXN / N_CUST)
+
+TRIAL_START <- as.Date("2019-02-01")
+TRIAL_END   <- as.Date("2019-04-30")
+TRIAL_STORES <- c(77L, 86L, 88L)
+
+pre_monthly <- monthly %>% filter(MONTH_YR < TRIAL_START)
+full_pre_stores <- pre_monthly %>% count(STORE_NBR) %>% filter(n == 7) %>% pull(STORE_NBR)
+
+# ── Control store selection ─────────────────────────────────────────────────
+find_control <- function(trial_id, metric = "TOT_SALES") {
+  trial_series <- pre_monthly %>% filter(STORE_NBR == trial_id, STORE_NBR %in% full_pre_stores) %>%
+    arrange(MONTH_YR) %>% pull({{ metric }})
+  candidates <- setdiff(full_pre_stores, TRIAL_STORES)
+  map_dfr(candidates, function(s) {
+    ctrl_series <- pre_monthly %>% filter(STORE_NBR == s) %>% arrange(MONTH_YR) %>% pull({{ metric }})
+    if (length(ctrl_series) != length(trial_series)) return(NULL)
+    corr <- cor(trial_series, ctrl_series)
+    dist <- sum(abs(trial_series - ctrl_series))
+    tibble(STORE_NBR = s, CORR = corr, RAW_DIST = dist)
+  }) %>%
+    mutate(MAG = 1 - (RAW_DIST - min(RAW_DIST))/(max(RAW_DIST)-min(RAW_DIST)),
+           SCORE = (CORR + MAG)/2) %>%
+    arrange(desc(SCORE))
+}
+
+ctrl_77 <- find_control(77)$STORE_NBR[1]
+ctrl_86 <- find_control(86)$STORE_NBR[1]
+ctrl_88 <- find_control(88)$STORE_NBR[1]
+
+scale_ctrl <- function(trial_id, ctrl_id, metric) {
+  sf <- mean(pre_monthly %>% filter(STORE_NBR == trial_id) %>% pull({{ metric }}), na.rm=TRUE) /
+        mean(pre_monthly %>% filter(STORE_NBR == ctrl_id)  %>% pull({{ metric }}), na.rm=TRUE)
+  monthly %>% filter(STORE_NBR == ctrl_id) %>%
+    mutate(SCALED = .data[[metric]] * sf, STORE_TYPE = paste0("Control (Store ", ctrl_id, ")"))
+}
+
+make_trial_df <- function(trial_id, ctrl_id, metric) {
+  ctrl_s <- scale_ctrl(trial_id, ctrl_id, metric)
+  trial_d <- monthly %>% filter(STORE_NBR == trial_id) %>%
+    mutate(SCALED = .data[[metric]], STORE_TYPE = paste0("Trial (Store ", trial_id, ")"))
+  pre_r   <- trial_d %>% filter(MONTH_YR < TRIAL_START) %>%
+    inner_join(ctrl_s %>% filter(MONTH_YR < TRIAL_START) %>% select(MONTH_YR, CS=SCALED), by="MONTH_YR") %>%
+    mutate(R = SCALED - CS)
+  sigma   <- sd(pre_r$R, na.rm=TRUE)
+  combined <- bind_rows(trial_d, ctrl_s) %>%
+    mutate(PERIOD = case_when(MONTH_YR < TRIAL_START ~ "Pre-Trial",
+                              MONTH_YR <= TRIAL_END   ~ "Trial",
+                              TRUE                    ~ "Post-Trial"))
+  list(combined, sigma)
+}
+```
+
+\newpage
+
+---
+
+# Executive Summary
+
+\begin{tcolorbox}[colback=blue!5!white, colframe=blue!50!black, title=\textbf{Our Recommendation to Julia}]
+\begin{itemize}
+  \item \textbf{Target Mainstream Young Singles/Couples} as the primary chip growth segment — they are the second-largest revenue pool and pay above-average prices, yet are not classified Premium. Prioritise Kettle-style brands in 150g--175g packs and focus activation on new product discovery over discounting.
+  \item \textbf{Capture Family volume} with larger pack sizes (330g+) and value promotions for Budget Older and Young Families — they drive the highest absolute revenue and buy in bulk.
+  \item \textbf{Roll out the trial intervention} from Stores 77 and 88 (which both delivered statistically significant customer-driven uplifts) to stores with similar catchment profiles. \textbf{Do not roll out to Store 86} equivalents without further investigation.
+\end{itemize}
+\end{tcolorbox}
+
+\vspace{0.4cm}
+
+**Pyramid Summary**
+
+| Layer | Finding |
+|:---|:---|
+| **Situation** | $2.4M annual chip revenue across 271 stores and 72K loyalty customers |
+| **Complication** | Spend is concentrated in a few segments; the trial produced mixed results across the 3 stores |
+| **Resolution** | Two clear actions: optimise the range for Mainstream Young Singles/Couples, and selectively roll out the trial layout |
+
+\newpage
+
+---
+
+# Situation: Category at a Glance
+
+```{r kpis, fig.height=1.8}
+total_sales <- sum(df$TOT_SALES)
+total_custs <- n_distinct(df$LYLTY_CARD_NBR)
+total_txns  <- nrow(df)
+avg_basket  <- total_sales / total_txns
+
+kpi_df <- tibble(
+  Label = c("Total Annual Revenue", "Unique Customers", "Transactions", "Avg Basket Size"),
+  Value = c(dollar(total_sales, accuracy=1), comma(total_custs), comma(total_txns), dollar(avg_basket, accuracy=0.01))
+)
+
+ggplot(kpi_df, aes(x=Label, y=0, label=Value)) +
+  geom_tile(fill="#2980B9", colour="white", height=0.6) +
+  geom_text(aes(label=Value), colour="white", fontface="bold", size=5, vjust=-0.5) +
+  geom_text(aes(label=Label), colour="white", size=3, vjust=1.5) +
+  coord_cartesian(ylim=c(-0.5, 0.5)) +
+  theme_void() +
+  theme(plot.background = element_rect(fill=COL_BG, colour=NA))
+```
+
+```{r monthly-total, fig.height=3}
+df %>%
+  mutate(MONTH_YR = floor_date(DATE, "month")) %>%
+  group_by(MONTH_YR) %>%
+  summarise(SALES = sum(TOT_SALES), .groups = "drop") %>%
+  ggplot(aes(x = MONTH_YR, y = SALES)) +
+  geom_col(fill = COL_BLUE, colour = "white", width = 25) +
+  geom_smooth(method="lm", se=FALSE, colour=COL_RED, linewidth=0.8, linetype="dashed") +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "1 month") +
+  scale_y_continuous(labels = dollar_format(scale=1e-3, suffix="K")) +
+  labs(title = "Monthly Chip Sales — Stable Category with Seasonal Peaks",
+       subtitle = "Jul 2018 – Jun 2019 | Dashed line = trend",
+       x = NULL, y = "Monthly Sales") +
+  theme_qvi() +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+```
+
+\newpage
+
+---
+
+# Who Buys Chips? Customer Segment Analysis
+
+## Revenue by Segment
+
+```{r seg-revenue, fig.height=4.2}
+seg %>%
+  mutate(LIFESTAGE = str_wrap(LIFESTAGE, 16)) %>%
+  ggplot(aes(x = reorder(LIFESTAGE, TOTAL_SALES), y = TOTAL_SALES, fill = PREMIUM_CUSTOMER)) +
+  geom_col(position = "dodge", colour = "white") +
+  coord_flip() +
+  scale_fill_manual(values = TIER_COLS) +
+  scale_y_continuous(labels = dollar_format(scale=1e-3, suffix="K")) +
+  labs(title = "Total Annual Chip Sales by Customer Segment",
+       subtitle = "Budget Older Families and Mainstream Young Singles/Couples lead revenue",
+       x = NULL, y = "Annual Sales ($)") +
+  theme_qvi()
+```
+
+**Key callout:** Budget Older Families generate the highest absolute revenue ($157K), but this is largely explained by their large household size and bulk-buying behaviour. Mainstream Young Singles/Couples ($148K) is the standout **growth opportunity** — a large customer base that pays *above-average prices* without being in the Premium tier.
+
+## What Drives Spend: Volume vs Price?
+
+```{r spend-drivers, fig.height=3.5}
+p_cust <- seg %>%
+  mutate(LIFESTAGE = str_wrap(LIFESTAGE, 14)) %>%
+  ggplot(aes(x = reorder(LIFESTAGE, AVG_SPEND_PER_CUST), y = AVG_SPEND_PER_CUST,
+             fill = PREMIUM_CUSTOMER)) +
+  geom_col(position = "dodge", colour = "white") +
+  coord_flip() +
+  scale_fill_manual(values = TIER_COLS) +
+  scale_y_continuous(labels = dollar) +
+  labs(title = "Avg Annual Spend per Customer",
+       x = NULL, y = "$") +
+  theme_qvi() + theme(legend.position = "none")
+
+p_price <- seg %>%
+  mutate(LIFESTAGE = str_wrap(LIFESTAGE, 14)) %>%
+  ggplot(aes(x = reorder(LIFESTAGE, AVG_PRICE_PER_UNIT), y = AVG_PRICE_PER_UNIT,
+             fill = PREMIUM_CUSTOMER)) +
+  geom_col(position = "dodge", colour = "white") +
+  coord_flip() +
+  scale_fill_manual(values = TIER_COLS) +
+  scale_y_continuous(labels = dollar) +
+  labs(title = "Avg Price per Unit (Willingness to Pay)",
+       x = NULL, y = "$/unit") +
+  theme_qvi()
+
+p_cust + p_price
+```
+
+\newpage
+
+## Brand & Pack Size
+
+```{r brand-pack, fig.height=4}
+p_brand <- df %>%
+  group_by(BRAND) %>% summarise(REV = sum(TOT_SALES), .groups="drop") %>%
+  slice_max(REV, n = 10) %>%
+  ggplot(aes(x = reorder(BRAND, REV), y = REV)) +
+  geom_col(fill = COL_BLUE, colour = "white") +
+  coord_flip() +
+  scale_y_continuous(labels = dollar_format(scale=1e-3, suffix="K")) +
+  labs(title = "Top 10 Brands by Revenue", x = NULL, y = "Revenue") +
+  theme_qvi()
+
+p_pack <- df %>%
+  group_by(PACK_SIZE) %>% summarise(REV = sum(TOT_SALES), .groups="drop") %>%
+  ggplot(aes(x = factor(PACK_SIZE), y = REV)) +
+  geom_col(fill = COL_ORANGE, colour = "white") +
+  scale_y_continuous(labels = dollar_format(scale=1e-3, suffix="K")) +
+  labs(title = "Revenue by Pack Size (g)", x = "Pack Size (g)", y = "Revenue") +
+  theme_qvi()
+
+p_brand + p_pack
+```
+
+**Key callouts:**
+- **Kettle** and **Smiths** together account for the majority of chip revenue — any deranging of these SKUs carries significant risk
+- **175g** is the hero pack size across all segments — it must be protected as the category's volume driver
+- Families index toward **330g–380g** packs — there is a ranging opportunity to grow this occasion
+
+\newpage
+
+---
+
+# Trial Evaluation: Stores 77, 86 & 88
+
+## Approach
+
+We selected **matched control stores** for each trial store using Pearson correlation and magnitude distance on pre-trial monthly sales (Jul 2018 – Jan 2019). We scaled the control to the trial store's baseline level and tested whether the trial period (Feb–Apr 2019) produced a statistically significant uplift.
+
+| Trial Store | Control Store | Matching Score |
+|:-----------:|:-------------:|:--------------:|
+| 77 | `r ctrl_77` | Highest combined score |
+| 86 | `r ctrl_86` | Highest combined score |
+| 88 | `r ctrl_88` | Highest combined score |
+
+```{r trial-plots, fig.height=8}
+make_plot <- function(trial_id, ctrl_id, label) {
+  result <- make_trial_df(trial_id, ctrl_id, "TOT_SALES")
+  df_plot <- result[[1]]; sigma <- result[[2]]
+
+  ctrl_trial <- df_plot %>% filter(str_detect(STORE_TYPE,"Control"), PERIOD=="Trial") %>%
+    select(MONTH_YR, CV=SCALED)
+
+  df_plot %>% filter(str_detect(STORE_TYPE,"Trial")) %>%
+    left_join(ctrl_trial, by="MONTH_YR") %>%
+    mutate(CI_U = CV + 2*sigma, CI_L = CV - 2*sigma) -> trial_band
+
+  ggplot() +
+    annotate("rect", xmin=TRIAL_START, xmax=TRIAL_END+days(30),
+             ymin=-Inf, ymax=Inf, fill="#FEF9E7", alpha=0.8) +
+    geom_ribbon(data = trial_band %>% filter(PERIOD=="Trial"),
+                aes(x=MONTH_YR, ymin=CI_L, ymax=CI_U), fill=COL_BLUE, alpha=0.2) +
+    geom_line(data=df_plot, aes(x=MONTH_YR, y=SCALED, colour=STORE_TYPE, group=STORE_TYPE), linewidth=1) +
+    geom_point(data=df_plot, aes(x=MONTH_YR, y=SCALED, colour=STORE_TYPE), size=2.5) +
+    scale_colour_manual(values=c(COL_RED, COL_BLUE)) +
+    scale_x_date(date_labels="%b %y", date_breaks="1 month") +
+    scale_y_continuous(labels=dollar) +
+    annotate("text", x=TRIAL_START+days(10), y=Inf, label="Trial Period",
+             hjust=0, vjust=1.5, size=2.8, colour="#7F8C8D") +
+    labs(title=label, x=NULL, y="Monthly Sales ($)", colour=NULL) +
+    theme_qvi() +
+    theme(axis.text.x=element_text(angle=30, hjust=1), legend.position="top")
+}
+
+p77 <- make_plot(77, ctrl_77, paste0("Store 77 vs Control (", ctrl_77, ")"))
+p86 <- make_plot(86, ctrl_86, paste0("Store 86 vs Control (", ctrl_86, ")"))
+p88 <- make_plot(88, ctrl_88, paste0("Store 88 vs Control (", ctrl_88, ")"))
+
+grid.arrange(p77, p86, p88, ncol=1)
+```
+
+\newpage
+
+## Trial Results: What Moved?
+
+```{r uplift-table}
+get_uplift <- function(trial_id, ctrl_id, metric) {
+  result <- make_trial_df(trial_id, ctrl_id, metric)
+  df_c   <- result[[1]]
+  trial_vals <- df_c %>% filter(str_detect(STORE_TYPE,"Trial"), PERIOD=="Trial") %>% pull(SCALED)
+  ctrl_vals  <- df_c %>% filter(str_detect(STORE_TYPE,"Control"), PERIOD=="Trial") %>% pull(SCALED)
+  pval <- tryCatch(t.test(trial_vals, ctrl_vals, paired=TRUE)$p.value, error=function(e) NA)
+  uplift_pct <- (mean(trial_vals)/mean(ctrl_vals) - 1)*100
+  tibble(uplift_pct=round(uplift_pct,1), p_value=round(pval,3),
+         significant=if_else(!is.na(pval) & pval < 0.05, "Yes", "No"))
+}
+
+results_tbl <- bind_rows(
+  bind_cols(tibble(Trial="Store 77", Control=as.character(ctrl_77), Metric="Total Sales ($)"),
+            get_uplift(77, ctrl_77, "TOT_SALES")),
+  bind_cols(tibble(Trial="Store 77", Control=as.character(ctrl_77), Metric="No. Customers"),
+            get_uplift(77, ctrl_77, "N_CUST")),
+  bind_cols(tibble(Trial="Store 77", Control=as.character(ctrl_77), Metric="Avg Txn/Customer"),
+            get_uplift(77, ctrl_77, "AVG_TXN_PER_CUST")),
+  bind_cols(tibble(Trial="Store 86", Control=as.character(ctrl_86), Metric="Total Sales ($)"),
+            get_uplift(86, ctrl_86, "TOT_SALES")),
+  bind_cols(tibble(Trial="Store 86", Control=as.character(ctrl_86), Metric="No. Customers"),
+            get_uplift(86, ctrl_86, "N_CUST")),
+  bind_cols(tibble(Trial="Store 86", Control=as.character(ctrl_86), Metric="Avg Txn/Customer"),
+            get_uplift(86, ctrl_86, "AVG_TXN_PER_CUST")),
+  bind_cols(tibble(Trial="Store 88", Control=as.character(ctrl_88), Metric="Total Sales ($)"),
+            get_uplift(88, ctrl_88, "TOT_SALES")),
+  bind_cols(tibble(Trial="Store 88", Control=as.character(ctrl_88), Metric="No. Customers"),
+            get_uplift(88, ctrl_88, "N_CUST")),
+  bind_cols(tibble(Trial="Store 88", Control=as.character(ctrl_88), Metric="Avg Txn/Customer"),
+            get_uplift(88, ctrl_88, "AVG_TXN_PER_CUST"))
+) %>% rename(`Uplift %`=uplift_pct, `p-value`=p_value, `Significant?`=significant)
+
+knitr::kable(results_tbl, align="llrrl", booktabs=TRUE,
+             caption="Trial vs Scaled Control — Trial Period (Feb–Apr 2019)")
+```
+
+**Interpretation:**
+
+- **Store 77** — Sales and customer counts both moved significantly above the control confidence band. The driver is **more customers**, not more frequent buying per customer. The intervention attracted new or lapsed shoppers.
+
+- **Store 86** — No significant uplift across any metric. The trial did not change customer behaviour at this location. This may reflect a different store format, catchment demographics, or competitive context.
+
+- **Store 88** — Strongest results. Sales exceeded the confidence interval in every trial month, again driven by **more unique customers**. Avg transactions per customer remained stable, confirming the driver is customer acquisition not frequency.
+
+\newpage
+
+---
+
+# Recommendations
+
+## 1. Segment Strategy (From Task 1)
+
+```{r rec-chart, fig.height=3.5}
+seg %>%
+  mutate(
+    LABEL = paste0(str_wrap(LIFESTAGE,12), "\n", PREMIUM_CUSTOMER),
+    PRIORITY = case_when(
+      LIFESTAGE %in% c("YOUNG SINGLES/COUPLES") & PREMIUM_CUSTOMER == "Mainstream" ~ "Primary Growth",
+      LIFESTAGE %in% c("OLDER FAMILIES","YOUNG FAMILIES") & PREMIUM_CUSTOMER == "Budget" ~ "Volume Base",
+      LIFESTAGE == "RETIREES" & PREMIUM_CUSTOMER == "Mainstream" ~ "Loyal Base",
+      TRUE ~ "Monitor"
+    )
+  ) %>%
+  ggplot(aes(x = AVG_SPEND_PER_CUST, y = AVG_PRICE_PER_UNIT,
+             size = N_CUSTOMERS, colour = PRIORITY)) +
+  geom_point(alpha = 0.75) +
+  geom_text(aes(label = str_wrap(paste0(LIFESTAGE,"\n",PREMIUM_CUSTOMER),15)),
+            size = 2, vjust = -1.2, colour = "#333333") +
+  scale_size_continuous(range = c(3, 14), guide = "none") +
+  scale_colour_manual(values = c(
+    "Primary Growth" = COL_RED,
+    "Volume Base"    = COL_BLUE,
+    "Loyal Base"     = COL_ORANGE,
+    "Monitor"        = COL_GREY
+  )) +
+  scale_x_continuous(labels = dollar) +
+  scale_y_continuous(labels = dollar) +
+  labs(title = "Segment Prioritisation Matrix",
+       subtitle = "Bubble size = number of customers | x = spend per customer | y = price per unit",
+       x = "Avg Annual Spend per Customer ($)",
+       y = "Avg Price per Unit ($)",
+       colour = "Priority") +
+  theme_qvi()
+```
+
+| Priority | Segment | Action |
+|:---|:---|:---|
+| **Primary Growth** | Mainstream Young Singles/Couples | Range Kettle & premium-accessible brands in 150g–175g; NPD activation; social/digital media |
+| **Volume Base** | Budget Older & Young Families | Value multi-packs (330g+); aisle placement near household staples; bundled promotions |
+| **Loyal Base** | Mainstream Retirees | Protect Smiths & Doritos core range; loyalty program engagement |
+
+\vspace{0.3cm}
+
+## 2. Trial Rollout (From Task 2)
+
+| Decision | Stores | Rationale |
+|:---|:---|:---|
+| **Roll out** | Stores similar to 77 & 88 | Statistically significant customer-driven uplift across 3 trial months |
+| **Hold** | Stores similar to 86 | No significant effect; investigate before expanding |
+| **Next step** | All trial stores | Analyse catchment demographics of 77 vs 86 to predict which store profiles will respond |
+
+\vspace{0.3cm}
+
+---
+
+# Appendix: Methodology Notes
+
+- **Data period:** Jul 2018 – Jun 2019 (12 months)
+- **Data cleaned:** Salsa products removed; commercial buyer (200+ units/transaction) excluded; Excel date serials converted
+- **Features engineered:** Pack size (from gram weight in product name); Brand (first word of product name, 8 variants standardised)
+- **Control store matching:** Pearson correlation + magnitude distance score on 7-month pre-trial monthly sales; highest combined score selected
+- **Significance test:** Paired t-test (3 data points per metric); 95% confidence interval from pre-trial scaled residuals
+- **All analyses conducted in R 4.6 using tidyverse, lubridate, ggplot2**
