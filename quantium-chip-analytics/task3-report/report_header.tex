@@ -1,0 +1,22 @@
+\usepackage{tcolorbox}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{fontspec}
+\usepackage{microtype}
+
+\definecolor{qvired}{HTML}{C0392B}
+\definecolor{qviblue}{HTML}{2980B9}
+
+% Title page styling
+\usepackage{titling}
+\pretitle{\begin{center}\LARGE\bfseries\color{qviblue}}
+\posttitle{\end{center}\vspace{0.2cm}}
+
+% Section styling
+\usepackage{titlesec}
+\titleformat{\section}{\large\bfseries\color{qviblue}}{}{0em}{}[\titlerule]
+\titleformat{\subsection}{\normalsize\bfseries\color{qvired}}{}{0em}{}
+
+% Table styling
+\usepackage{longtable}
+\usepackage{array}
