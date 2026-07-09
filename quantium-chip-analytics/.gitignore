@@ -1,0 +1,26 @@
+# Rendered outputs (regenerate with Rscript)
+*.pdf
+*_files/
+
+# R session
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Python
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Environment / credentials
+.env
+*.json
+token.json
+credentials.json
+
+# Temp
+.tmp/
