@@ -1,0 +1,441 @@
+---
+title: "QVI Chip Category Analysis"
+author: "Chloe Truong"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 4)
+```
+
+# Introduction
+
+This analysis examines chip purchasing behaviour across customer segments to support the upcoming category review for Julia (Category Manager). We explore transaction data and customer segmentation to identify who buys chips, how much they spend, and what drives their purchasing decisions.
+
+---
+
+# Setup & Data Loading
+
+```{r load}
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(scales)
+
+transactions      <- read_excel("~/Downloads/QVI_transaction_data.xlsx")
+purchase_behaviour <- read_csv("~/Downloads/QVI_purchase_behaviour.csv")
+
+cat("Transactions:      ", nrow(transactions), "rows x", ncol(transactions), "cols\n")
+cat("Purchase Behaviour:", nrow(purchase_behaviour), "rows x", ncol(purchase_behaviour), "cols\n")
+```
+
+---
+
+# High-Level Data Checks
+
+## Transactions
+
+```{r check-txn}
+glimpse(transactions)
+summary(transactions)
+cat("\nMissing values:\n")
+colSums(is.na(transactions))
+```
+
+## Purchase Behaviour
+
+```{r check-pb}
+glimpse(purchase_behaviour)
+
+cat("\nLifestage segments:\n")
+unique(purchase_behaviour$LIFESTAGE)
+
+cat("\nPremium tiers:\n")
+unique(purchase_behaviour$PREMIUM_CUSTOMER)
+
+cat("\nMissing values:\n")
+colSums(is.na(purchase_behaviour))
+```
+
+---
+
+# Data Cleaning & Format Corrections
+
+## Fix Date Format
+
+The `DATE` column is stored as an Excel serial number. We convert it to a proper date (Excel epoch: 1899-12-30).
+
+```{r fix-date}
+transactions <- transactions %>%
+  mutate(DATE = as.Date(DATE, origin = "1899-12-30"))
+
+cat("Date range:", format(min(transactions$DATE)), "to", format(max(transactions$DATE)), "\n")
+head(transactions$DATE)
+```
+
+## Remove Non-Chip Products
+
+```{r remove-salsa}
+# Identify products without gram weights (non-chips)
+non_chip <- transactions %>%
+  filter(!str_detect(PROD_NAME, "\\d")) %>%
+  distinct(PROD_NAME)
+cat("Non-chip products found:\n")
+print(non_chip)
+
+# Remove salsa products
+before <- nrow(transactions)
+transactions <- transactions %>%
+  filter(!str_detect(str_to_lower(PROD_NAME), "salsa"))
+cat("Removed", before - nrow(transactions), "salsa rows\n")
+cat("Remaining:", nrow(transactions), "\n")
+```
+
+## Remove Duplicate Rows
+
+```{r remove-dupes}
+before <- nrow(transactions)
+transactions <- transactions %>% distinct()
+cat("Duplicate rows removed:", before - nrow(transactions), "\n")
+```
+
+---
+
+# Outlier Detection & Removal
+
+```{r outlier-summary}
+summary(transactions$PROD_QTY)
+summary(transactions$TOT_SALES)
+```
+
+```{r outlier-plot}
+p1 <- ggplot(transactions, aes(x = PROD_QTY)) +
+  geom_histogram(bins = 20, fill = "steelblue", colour = "white") +
+  labs(title = "Distribution of Product Quantity", x = "Units Purchased", y = "Count") +
+  theme_minimal()
+
+p2 <- ggplot(transactions, aes(x = TOT_SALES)) +
+  geom_histogram(bins = 30, fill = "coral", colour = "white") +
+  labs(title = "Distribution of Total Sales ($)", x = "Sale Value ($)", y = "Count") +
+  theme_minimal()
+
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+
+```{r investigate-outliers}
+# Customers buying > 20 units in a single transaction
+high_qty <- transactions %>% filter(PROD_QTY > 20)
+cat("Transactions with PROD_QTY > 20:\n")
+print(high_qty %>% select(DATE, LYLTY_CARD_NBR, PROD_NAME, PROD_QTY, TOT_SALES))
+
+# Full history of suspicious cards
+suspect_cards <- high_qty %>% pull(LYLTY_CARD_NBR) %>% unique()
+cat("\nFull purchase history of suspicious customers:\n")
+transactions %>%
+  filter(LYLTY_CARD_NBR %in% suspect_cards) %>%
+  arrange(LYLTY_CARD_NBR, DATE) %>%
+  print()
+```
+
+```{r remove-commercial}
+# Cards consistently buying 200 units are commercial buyers — remove
+before <- nrow(transactions)
+transactions <- transactions %>%
+  filter(!LYLTY_CARD_NBR %in% suspect_cards)
+cat("Removed", before - nrow(transactions), "commercial-buyer rows\n")
+cat("Final transactions:", nrow(transactions), "\n")
+```
+
+## Monthly Transaction Volume
+
+```{r monthly-volume}
+transactions %>%
+  mutate(MONTH = floor_date(DATE, "month")) %>%
+  count(MONTH) %>%
+  ggplot(aes(x = MONTH, y = n)) +
+  geom_col(fill = "steelblue", colour = "white") +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "1 month") +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Monthly Transaction Volume",
+       x = NULL, y = "Number of Transactions",
+       caption = "Note: December dip reflects a shorter data window, not a true drop in sales.") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+---
+
+# Feature Engineering
+
+## Pack Size
+
+```{r pack-size}
+transactions <- transactions %>%
+  mutate(PACK_SIZE = as.numeric(str_extract(PROD_NAME, "\\d+(?=g)")))
+
+cat("Pack sizes found (grams):", sort(unique(transactions$PACK_SIZE)), "\n")
+cat("Missing pack sizes:", sum(is.na(transactions$PACK_SIZE)), "\n")
+```
+
+```{r pack-size-plot}
+transactions %>%
+  count(PACK_SIZE) %>%
+  ggplot(aes(x = factor(PACK_SIZE), y = n)) +
+  geom_col(fill = "steelblue", colour = "white") +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Transaction Count by Pack Size (grams)",
+       x = "Pack Size (g)", y = "Number of Transactions") +
+  theme_minimal()
+```
+
+## Brand Name
+
+```{r brand}
+transactions <- transactions %>%
+  mutate(
+    BRAND = str_to_upper(word(PROD_NAME, 1)),
+    BRAND = recode(BRAND,
+      "RED"    = "RRD",
+      "SNBTS"  = "SUNBITES",
+      "INFZNS" = "INFUZIONS",
+      "DORITO" = "DORITOS",
+      "GRAIN"  = "GRNWVES",
+      "SMITH"  = "SMITHS",
+      "NCC"    = "NATURAL",
+      "WW"     = "WOOLWORTHS"
+    )
+  )
+
+cat("Unique brands after cleaning:\n")
+sort(unique(transactions$BRAND))
+```
+
+```{r brand-plot}
+transactions %>%
+  group_by(BRAND) %>%
+  summarise(REVENUE = sum(TOT_SALES), TRANSACTIONS = n()) %>%
+  arrange(desc(REVENUE)) %>%
+  ggplot(aes(x = reorder(BRAND, REVENUE), y = REVENUE)) +
+  geom_col(fill = "steelblue", colour = "white") +
+  coord_flip() +
+  scale_y_continuous(labels = dollar) +
+  labs(title = "Total Revenue by Brand", x = NULL, y = "Revenue ($)") +
+  theme_minimal()
+```
+
+---
+
+# Merge Datasets
+
+```{r merge}
+df <- transactions %>%
+  left_join(purchase_behaviour, by = "LYLTY_CARD_NBR") %>%
+  drop_na(LIFESTAGE, PREMIUM_CUSTOMER)
+
+cat("Merged dataset:", nrow(df), "rows\n")
+```
+
+---
+
+# Customer Segment Metrics
+
+```{r segment-metrics}
+segment_metrics <- df %>%
+  group_by(LIFESTAGE, PREMIUM_CUSTOMER) %>%
+  summarise(
+    TOTAL_SALES        = sum(TOT_SALES),
+    TOTAL_CUSTOMERS    = n_distinct(LYLTY_CARD_NBR),
+    TOTAL_TRANSACTIONS = n(),
+    TOTAL_UNITS        = sum(PROD_QTY),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    AVG_SPEND_PER_CUSTOMER = round(TOTAL_SALES / TOTAL_CUSTOMERS, 2),
+    AVG_PRICE_PER_UNIT     = round(TOTAL_SALES / TOTAL_UNITS, 2),
+    AVG_TXN_PER_CUSTOMER   = round(TOTAL_TRANSACTIONS / TOTAL_CUSTOMERS, 2),
+    AVG_UNITS_PER_TXN      = round(TOTAL_UNITS / TOTAL_TRANSACTIONS, 2)
+  )
+
+segment_metrics %>%
+  arrange(desc(TOTAL_SALES)) %>%
+  print(n = 21)
+```
+
+---
+
+# Segment Analysis: Who Drives Chip Sales?
+
+## Total Revenue by Segment
+
+```{r heatmap-sales}
+segment_metrics %>%
+  mutate(PREMIUM_CUSTOMER = factor(PREMIUM_CUSTOMER, levels = c("Budget","Mainstream","Premium"))) %>%
+  ggplot(aes(x = PREMIUM_CUSTOMER, y = LIFESTAGE, fill = TOTAL_SALES)) +
+  geom_tile(colour = "white", linewidth = 0.8) +
+  geom_text(aes(label = dollar(round(TOTAL_SALES, 0))), size = 3) +
+  scale_fill_gradient(low = "#fff5eb", high = "#d94801", labels = dollar) +
+  labs(title = "Total Chip Sales ($) by Customer Segment",
+       x = "Customer Tier", y = "Lifestage", fill = "Revenue") +
+  theme_minimal()
+```
+
+## Number of Customers per Segment
+
+```{r heatmap-customers}
+segment_metrics %>%
+  mutate(PREMIUM_CUSTOMER = factor(PREMIUM_CUSTOMER, levels = c("Budget","Mainstream","Premium"))) %>%
+  ggplot(aes(x = PREMIUM_CUSTOMER, y = LIFESTAGE, fill = TOTAL_CUSTOMERS)) +
+  geom_tile(colour = "white", linewidth = 0.8) +
+  geom_text(aes(label = comma(TOTAL_CUSTOMERS)), size = 3) +
+  scale_fill_gradient(low = "#eff3ff", high = "#08519c", labels = comma) +
+  labs(title = "Number of Customers by Segment",
+       x = "Customer Tier", y = "Lifestage", fill = "Customers") +
+  theme_minimal()
+```
+
+## Average Spend per Customer
+
+```{r heatmap-spend}
+segment_metrics %>%
+  mutate(PREMIUM_CUSTOMER = factor(PREMIUM_CUSTOMER, levels = c("Budget","Mainstream","Premium"))) %>%
+  ggplot(aes(x = PREMIUM_CUSTOMER, y = LIFESTAGE, fill = AVG_SPEND_PER_CUSTOMER)) +
+  geom_tile(colour = "white", linewidth = 0.8) +
+  geom_text(aes(label = dollar(AVG_SPEND_PER_CUSTOMER)), size = 3) +
+  scale_fill_gradient(low = "#f7fcf5", high = "#00441b", labels = dollar) +
+  labs(title = "Avg Annual Spend per Customer ($) by Segment",
+       x = "Customer Tier", y = "Lifestage", fill = "Spend/Customer") +
+  theme_minimal()
+```
+
+## Average Price per Unit (Willingness to Pay)
+
+```{r heatmap-price}
+segment_metrics %>%
+  mutate(PREMIUM_CUSTOMER = factor(PREMIUM_CUSTOMER, levels = c("Budget","Mainstream","Premium"))) %>%
+  ggplot(aes(x = PREMIUM_CUSTOMER, y = LIFESTAGE, fill = AVG_PRICE_PER_UNIT)) +
+  geom_tile(colour = "white", linewidth = 0.8) +
+  geom_text(aes(label = dollar(AVG_PRICE_PER_UNIT)), size = 3) +
+  scale_fill_gradient(low = "#f2f0f7", high = "#54278f", labels = dollar) +
+  labs(title = "Avg Price per Unit ($) by Segment — Willingness to Pay",
+       x = "Customer Tier", y = "Lifestage", fill = "Price/Unit") +
+  theme_minimal()
+```
+
+---
+
+# Deep Dive: Top Segments
+
+## Top 3 Segments by Revenue
+
+```{r top3}
+top3 <- segment_metrics %>%
+  slice_max(TOTAL_SALES, n = 3) %>%
+  select(LIFESTAGE, PREMIUM_CUSTOMER, TOTAL_SALES, TOTAL_CUSTOMERS,
+         AVG_SPEND_PER_CUSTOMER, AVG_TXN_PER_CUSTOMER, AVG_PRICE_PER_UNIT)
+
+print(top3)
+```
+
+## Brand Preference in Top Segments
+
+```{r brand-top-segs, fig.height=5}
+top3_labels <- top3 %>%
+  mutate(SEG = paste(LIFESTAGE, PREMIUM_CUSTOMER, sep = "\n")) %>%
+  select(LIFESTAGE, PREMIUM_CUSTOMER, SEG)
+
+df %>%
+  inner_join(top3_labels, by = c("LIFESTAGE","PREMIUM_CUSTOMER")) %>%
+  group_by(SEG, BRAND) %>%
+  summarise(REVENUE = sum(TOT_SALES), .groups = "drop") %>%
+  group_by(SEG) %>%
+  slice_max(REVENUE, n = 8) %>%
+  ggplot(aes(x = reorder(BRAND, REVENUE), y = REVENUE, fill = SEG)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~SEG, scales = "free_x") +
+  scale_y_continuous(labels = dollar) +
+  labs(title = "Top Brands in Top 3 Segments", x = NULL, y = "Revenue ($)") +
+  theme_minimal() +
+  theme(strip.text = element_text(size = 7))
+```
+
+## Pack Size Preference in Top Segments
+
+```{r pack-top-segs, fig.height=5}
+df %>%
+  inner_join(top3_labels, by = c("LIFESTAGE","PREMIUM_CUSTOMER")) %>%
+  group_by(SEG, PACK_SIZE) %>%
+  summarise(REVENUE = sum(TOT_SALES), .groups = "drop") %>%
+  ggplot(aes(x = factor(PACK_SIZE), y = REVENUE, fill = SEG)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~SEG) +
+  scale_y_continuous(labels = dollar) +
+  labs(title = "Pack Size Preference in Top 3 Segments",
+       x = "Pack Size (g)", y = "Revenue ($)") +
+  theme_minimal()
+```
+
+## Price Sensitivity — Mainstream Segment by Lifestage
+
+```{r mainstream-price}
+df %>%
+  filter(PREMIUM_CUSTOMER == "Mainstream") %>%
+  group_by(LIFESTAGE) %>%
+  summarise(AVG_PRICE = sum(TOT_SALES) / sum(PROD_QTY), .groups = "drop") %>%
+  ggplot(aes(x = reorder(LIFESTAGE, AVG_PRICE), y = AVG_PRICE)) +
+  geom_col(fill = "mediumpurple", colour = "white") +
+  coord_flip() +
+  scale_y_continuous(labels = dollar) +
+  labs(title = "Avg Price per Unit — Mainstream Customers by Lifestage",
+       x = NULL, y = "Avg Price per Unit ($)") +
+  theme_minimal()
+```
+
+---
+
+# Key Insights & Strategic Recommendation
+
+## Summary of Findings
+
+**1. Biggest revenue segments by total sales:**
+
+- **Budget Older Families** — largest revenue driver; big household, high units per trip
+- **Mainstream Young Singles/Couples** — large customer pool, high purchase frequency
+- **Mainstream Retirees** — consistent, loyal buyers
+
+**2. Highest spend per customer:**
+
+Older and Young Families (Budget) buy the most units per trip — household buying behaviour. They are volume drivers, not necessarily premium drivers.
+
+**3. Mainstream Young Singles/Couples pay above-average price per unit:**
+
+Despite being classified as "Mainstream", this segment pays more per unit than Budget segments and nearly as much as Premium equivalents — they are willing to pay for quality chips (e.g., Kettle). This makes them the most attractive growth segment.
+
+**4. Pack size trends:**
+
+- 175g dominates across all segments — it should remain the hero SKU
+- Families (Older + Young) index toward larger packs (330g–380g) — opportunity to grow these SKUs in the family shopping occasion
+
+**5. Brand landscape:**
+
+- Kettle and Smiths are the top two brands across most segments
+- Mainstream Young Singles/Couples show the strongest Kettle affinity — a premium-taste, accessible-price positioning
+
+---
+
+## Recommendation to Julia
+
+> **Target Mainstream Young Singles/Couples as the primary growth segment.**
+> They are the second largest revenue segment, have the highest frequency of purchase, and pay above-average prices — suggesting they respond to product quality over promotions. Prioritise shelf space and visibility for Kettle-style brands in 150g–175g packs. Promotional mechanics for this group should focus on NPD (new product discovery) over deep discounting.
+>
+> **For Families (Budget), drive volume through value multi-packs.**
+> Their high units-per-trip behaviour and large household size make them ideal targets for bulk-pack promotions. Ranging larger pack sizes (330g+) prominently in the family aisle will capture this occasion more effectively.
+>
+> **Retirees are a stable, loyal base — protect with consistent ranging of familiar brands (Smiths, Doritos).**
+> Avoid deranging core SKUs that this segment purchases repeatedly.
