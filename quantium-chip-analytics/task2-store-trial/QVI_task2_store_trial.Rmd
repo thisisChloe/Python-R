@@ -1,0 +1,467 @@
+---
+title: "QVI Store Trial Evaluation — Task 2"
+author: "Chloe Truong"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 4)
+```
+
+# Introduction
+
+Julia has asked us to evaluate the performance of a store trial conducted in stores **77**, **86**, and **88**. Our objective is to:
+
+1. Select appropriate **control stores** (stores not in the trial that behaved similarly pre-trial)
+2. Compare each trial store against its matched control during the **trial period (Feb–Apr 2019)**
+3. Determine whether differences in sales are statistically significant
+4. Identify whether the driver of change is more **customers** or more **transactions per customer**
+
+---
+
+# Setup & Data Preparation
+
+```{r load-and-clean}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readxl)
+  library(lubridate)
+  library(scales)
+  library(gridExtra)
+})
+
+# ── Rebuild cleaned dataset from Task 1 ────────────────────────────────────
+txn <- read_excel("~/Downloads/QVI_transaction_data.xlsx") %>%
+  mutate(DATE = as.Date(DATE, origin = "1899-12-30")) %>%
+  filter(!str_detect(str_to_lower(PROD_NAME), "salsa")) %>%
+  distinct()
+
+# Remove commercial buyers (PROD_QTY > 200 in a single transaction)
+suspect_cards <- txn %>% filter(PROD_QTY > 200) %>% pull(LYLTY_CARD_NBR) %>% unique()
+txn <- txn %>% filter(!LYLTY_CARD_NBR %in% suspect_cards)
+
+pb <- read_csv("~/Downloads/QVI_purchase_behaviour.csv", show_col_types = FALSE)
+
+df <- txn %>%
+  left_join(pb, by = "LYLTY_CARD_NBR") %>%
+  drop_na(LIFESTAGE, PREMIUM_CUSTOMER)
+
+cat("Dataset ready:", nrow(df), "rows |", n_distinct(df$STORE_NBR), "stores\n")
+cat("Date range:", format(min(df$DATE)), "to", format(max(df$DATE)), "\n")
+```
+
+```{r monthly-metrics}
+# ── Monthly store-level metrics ─────────────────────────────────────────────
+monthly <- df %>%
+  mutate(MONTH_YR = floor_date(DATE, "month")) %>%
+  group_by(STORE_NBR, MONTH_YR) %>%
+  summarise(
+    TOT_SALES     = sum(TOT_SALES),
+    N_CUSTOMERS   = n_distinct(LYLTY_CARD_NBR),
+    N_TRANSACTIONS = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(AVG_TXN_PER_CUST = N_TRANSACTIONS / N_CUSTOMERS)
+
+# Trial and pre-trial windows
+TRIAL_START <- as.Date("2019-02-01")
+TRIAL_END   <- as.Date("2019-04-30")
+PRE_END     <- as.Date("2019-01-31")
+
+# Only keep stores with a full 7-month pre-trial window
+pre_monthly <- monthly %>% filter(MONTH_YR < TRIAL_START)
+
+full_pre_stores <- pre_monthly %>%
+  count(STORE_NBR) %>%
+  filter(n == 7) %>%
+  pull(STORE_NBR)
+
+cat("Stores with full pre-trial data:", length(full_pre_stores), "\n")
+```
+
+---
+
+# Control Store Selection
+
+## Scoring Function
+
+For each trial store we score every other store on three metrics during the **pre-trial period**:
+
+- **Pearson correlation** of monthly total sales
+- **Magnitude distance** of monthly total sales:
+  `1 - (|trial - store| - min_dist) / (max_dist - min_dist)`
+
+We average both scores then rank candidates. The control store is the highest-scoring non-trial store.
+
+```{r control-fn}
+TRIAL_STORES <- c(77L, 86L, 88L)
+
+# Returns a ranked data frame of candidate control stores for one trial store
+find_control_stores <- function(trial_store_id, metric = "TOT_SALES") {
+
+  trial_series <- pre_monthly %>%
+    filter(STORE_NBR == trial_store_id, STORE_NBR %in% full_pre_stores) %>%
+    arrange(MONTH_YR) %>%
+    pull({{ metric }})
+
+  candidates <- setdiff(full_pre_stores, TRIAL_STORES)
+
+  scores <- map_dfr(candidates, function(s) {
+    ctrl_series <- pre_monthly %>%
+      filter(STORE_NBR == s) %>%
+      arrange(MONTH_YR) %>%
+      pull({{ metric }})
+
+    if (length(ctrl_series) != length(trial_series)) return(NULL)
+
+    corr <- cor(trial_series, ctrl_series, method = "pearson")
+    dist <- sum(abs(trial_series - ctrl_series))
+
+    tibble(STORE_NBR = s, CORR = corr, RAW_DIST = dist)
+  })
+
+  # Magnitude distance score: higher = more similar
+  scores <- scores %>%
+    mutate(
+      MAG_SCORE = 1 - (RAW_DIST - min(RAW_DIST)) / (max(RAW_DIST) - min(RAW_DIST)),
+      COMBINED  = (CORR + MAG_SCORE) / 2
+    ) %>%
+    arrange(desc(COMBINED))
+
+  scores
+}
+```
+
+## Store 77 — Control Selection
+
+```{r ctrl-77}
+scores_77 <- find_control_stores(77)
+cat("Top 5 control candidates for Store 77:\n")
+print(head(scores_77, 5))
+ctrl_77 <- scores_77$STORE_NBR[1]
+cat("\nSelected control store:", ctrl_77, "\n")
+```
+
+## Store 86 — Control Selection
+
+```{r ctrl-86}
+scores_86 <- find_control_stores(86)
+cat("Top 5 control candidates for Store 86:\n")
+print(head(scores_86, 5))
+ctrl_86 <- scores_86$STORE_NBR[1]
+cat("\nSelected control store:", ctrl_86, "\n")
+```
+
+## Store 88 — Control Selection
+
+```{r ctrl-88}
+scores_88 <- find_control_stores(88)
+cat("Top 5 control candidates for Store 88:\n")
+print(head(scores_88, 5))
+ctrl_88 <- scores_88$STORE_NBR[1]
+cat("\nSelected control store:", ctrl_88, "\n")
+```
+
+---
+
+# Pre-Trial Validation: Visual Check
+
+Before using these control stores, we visually confirm the pre-trial trends align.
+
+```{r pretrial-visual, fig.height=9}
+pairs <- list(
+  list(trial = 77,  ctrl = ctrl_77, label = "Store 77"),
+  list(trial = 86,  ctrl = ctrl_86, label = "Store 86"),
+  list(trial = 88,  ctrl = ctrl_88, label = "Store 88")
+)
+
+plots <- map(pairs, function(p) {
+  monthly %>%
+    filter(STORE_NBR %in% c(p$trial, p$ctrl),
+           MONTH_YR < TRIAL_START) %>%
+    mutate(TYPE = if_else(STORE_NBR == p$trial, "Trial", "Control")) %>%
+    ggplot(aes(x = MONTH_YR, y = TOT_SALES, colour = TYPE, group = TYPE)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 2) +
+    scale_colour_manual(values = c("Trial" = "#e34a33", "Control" = "#2b8cbe")) +
+    scale_y_continuous(labels = dollar) +
+    scale_x_date(date_labels = "%b %Y", date_breaks = "1 month") +
+    labs(title = paste(p$label, "vs Control Store", p$ctrl, "— Pre-Trial Sales"),
+         x = NULL, y = "Monthly Sales ($)", colour = NULL) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1),
+          legend.position = "top")
+})
+
+grid.arrange(grobs = plots, ncol = 1)
+```
+
+---
+
+# Trial Period Comparison
+
+## Scaling Approach
+
+To account for baseline size differences we **scale** the control store to the trial store's level:
+
+$$\text{Scaled Control} = \text{Control}_{\text{month}} \times \frac{\text{Trial pre-trial mean}}{\text{Control pre-trial mean}}$$
+
+We then compute a **95% confidence interval** from the pre-trial scaled residuals. If the trial store's value falls **outside** this interval during the trial, the change is statistically significant.
+
+```{r compare-fn}
+compare_trial_control <- function(trial_id, ctrl_id, metric) {
+
+  trial_pre <- monthly %>%
+    filter(STORE_NBR == trial_id, MONTH_YR < TRIAL_START) %>%
+    pull({{ metric }}) %>% mean(na.rm = TRUE)
+
+  ctrl_pre <- monthly %>%
+    filter(STORE_NBR == ctrl_id, MONTH_YR < TRIAL_START) %>%
+    pull({{ metric }}) %>% mean(na.rm = TRUE)
+
+  scale_factor <- trial_pre / ctrl_pre
+
+  ctrl_scaled <- monthly %>%
+    filter(STORE_NBR == ctrl_id) %>%
+    mutate(SCALED = .data[[metric]] * scale_factor,
+           STORE_TYPE = paste0("Control ", ctrl_id, " (scaled)"))
+
+  trial_data <- monthly %>%
+    filter(STORE_NBR == trial_id) %>%
+    mutate(SCALED = .data[[metric]], STORE_TYPE = paste0("Trial ", trial_id))
+
+  # Pre-trial SD from scaled control residuals vs trial
+  pre_resid <- trial_data %>%
+    filter(MONTH_YR < TRIAL_START) %>%
+    inner_join(ctrl_scaled %>% filter(MONTH_YR < TRIAL_START) %>%
+                 select(MONTH_YR, CTRL_SCALED = SCALED),
+               by = "MONTH_YR") %>%
+    mutate(RESID = SCALED - CTRL_SCALED)
+
+  sigma <- sd(pre_resid$RESID, na.rm = TRUE)
+
+  combined <- bind_rows(trial_data, ctrl_scaled) %>%
+    mutate(PERIOD = case_when(
+      MONTH_YR < TRIAL_START  ~ "Pre-Trial",
+      MONTH_YR <= TRIAL_END   ~ "Trial",
+      TRUE                    ~ "Post-Trial"
+    ))
+
+  list(data = combined, sigma = sigma, scale_factor = scale_factor)
+}
+```
+
+```{r plot-fn}
+plot_comparison <- function(result, trial_id, ctrl_id, metric, metric_label) {
+
+  df_plot <- result$data
+  sigma    <- result$sigma
+
+  # Confidence bounds centred on scaled control during trial
+  ctrl_trial <- df_plot %>%
+    filter(str_detect(STORE_TYPE, "Control"), PERIOD == "Trial") %>%
+    select(MONTH_YR, CTRL_VAL = SCALED)
+
+  trial_plot <- df_plot %>%
+    filter(str_detect(STORE_TYPE, "Trial")) %>%
+    left_join(ctrl_trial, by = "MONTH_YR") %>%
+    mutate(
+      CI_UPPER = CTRL_VAL + 2 * sigma,
+      CI_LOWER = CTRL_VAL - 2 * sigma
+    )
+
+  ggplot() +
+    # Shaded trial window
+    annotate("rect",
+             xmin = TRIAL_START, xmax = TRIAL_END + days(30),
+             ymin = -Inf, ymax = Inf,
+             fill = "#fef0d9", alpha = 0.6) +
+    # Confidence band (trial period only)
+    geom_ribbon(data = trial_plot %>% filter(PERIOD == "Trial"),
+                aes(x = MONTH_YR, ymin = CI_LOWER, ymax = CI_UPPER),
+                fill = "#2b8cbe", alpha = 0.2) +
+    # Lines
+    geom_line(data = df_plot,
+              aes(x = MONTH_YR, y = SCALED, colour = STORE_TYPE, group = STORE_TYPE),
+              linewidth = 1) +
+    geom_point(data = df_plot,
+               aes(x = MONTH_YR, y = SCALED, colour = STORE_TYPE),
+               size = 2) +
+    scale_colour_manual(values = c("#e34a33", "#2b8cbe")) +
+    scale_x_date(date_labels = "%b %Y", date_breaks = "1 month") +
+    labs(
+      title    = paste0("Store ", trial_id, " vs Control ", ctrl_id, " — ", metric_label),
+      subtitle = "Shaded area = trial period | Band = 95% confidence interval",
+      x = NULL, y = metric_label, colour = NULL
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1),
+          legend.position = "top")
+}
+```
+
+---
+
+## Store 77
+
+```{r store77-sales, fig.height=3.5}
+r77_sales  <- compare_trial_control(77, ctrl_77, "TOT_SALES")
+r77_cust   <- compare_trial_control(77, ctrl_77, "N_CUSTOMERS")
+r77_txn    <- compare_trial_control(77, ctrl_77, "AVG_TXN_PER_CUST")
+
+plot_comparison(r77_sales, 77, ctrl_77, "TOT_SALES", "Total Sales ($)")
+```
+
+```{r store77-cust, fig.height=3.5}
+plot_comparison(r77_cust, 77, ctrl_77, "N_CUSTOMERS", "Number of Customers")
+```
+
+```{r store77-txn, fig.height=3.5}
+plot_comparison(r77_txn, 77, ctrl_77, "AVG_TXN_PER_CUST", "Avg Transactions per Customer")
+```
+
+```{r store77-ttest}
+# t-test: is trial store sales during trial significantly different from scaled control?
+trial_77  <- monthly %>% filter(STORE_NBR == 77, MONTH_YR >= TRIAL_START, MONTH_YR <= TRIAL_END) %>% pull(TOT_SALES)
+ctrl_77_s <- monthly %>% filter(STORE_NBR == ctrl_77, MONTH_YR >= TRIAL_START, MONTH_YR <= TRIAL_END) %>%
+               pull(TOT_SALES) * r77_sales$scale_factor
+
+cat("=== Store 77 vs Control", ctrl_77, "— Trial Period t-test (Total Sales) ===\n")
+t.test(trial_77, ctrl_77_s, paired = TRUE) %>% print()
+
+cat("\nTrial store monthly sales (trial period):", round(trial_77, 1), "\n")
+cat("Scaled control monthly sales (trial period):", round(ctrl_77_s, 1), "\n")
+cat("Uplift %:", round((mean(trial_77)/mean(ctrl_77_s) - 1)*100, 1), "%\n")
+```
+
+---
+
+## Store 86
+
+```{r store86-sales, fig.height=3.5}
+r86_sales <- compare_trial_control(86, ctrl_86, "TOT_SALES")
+r86_cust  <- compare_trial_control(86, ctrl_86, "N_CUSTOMERS")
+r86_txn   <- compare_trial_control(86, ctrl_86, "AVG_TXN_PER_CUST")
+
+plot_comparison(r86_sales, 86, ctrl_86, "TOT_SALES", "Total Sales ($)")
+```
+
+```{r store86-cust, fig.height=3.5}
+plot_comparison(r86_cust, 86, ctrl_86, "N_CUSTOMERS", "Number of Customers")
+```
+
+```{r store86-txn, fig.height=3.5}
+plot_comparison(r86_txn, 86, ctrl_86, "AVG_TXN_PER_CUST", "Avg Transactions per Customer")
+```
+
+```{r store86-ttest}
+trial_86  <- monthly %>% filter(STORE_NBR == 86, MONTH_YR >= TRIAL_START, MONTH_YR <= TRIAL_END) %>% pull(TOT_SALES)
+ctrl_86_s <- monthly %>% filter(STORE_NBR == ctrl_86, MONTH_YR >= TRIAL_START, MONTH_YR <= TRIAL_END) %>%
+               pull(TOT_SALES) * r86_sales$scale_factor
+
+cat("=== Store 86 vs Control", ctrl_86, "— Trial Period t-test (Total Sales) ===\n")
+t.test(trial_86, ctrl_86_s, paired = TRUE) %>% print()
+
+cat("\nTrial store monthly sales (trial period):", round(trial_86, 1), "\n")
+cat("Scaled control monthly sales (trial period):", round(ctrl_86_s, 1), "\n")
+cat("Uplift %:", round((mean(trial_86)/mean(ctrl_86_s) - 1)*100, 1), "%\n")
+```
+
+---
+
+## Store 88
+
+```{r store88-sales, fig.height=3.5}
+r88_sales <- compare_trial_control(88, ctrl_88, "TOT_SALES")
+r88_cust  <- compare_trial_control(88, ctrl_88, "N_CUSTOMERS")
+r88_txn   <- compare_trial_control(88, ctrl_88, "AVG_TXN_PER_CUST")
+
+plot_comparison(r88_sales, 88, ctrl_88, "TOT_SALES", "Total Sales ($)")
+```
+
+```{r store88-cust, fig.height=3.5}
+plot_comparison(r88_cust, 88, ctrl_88, "N_CUSTOMERS", "Number of Customers")
+```
+
+```{r store88-txn, fig.height=3.5}
+plot_comparison(r88_txn, 88, ctrl_88, "AVG_TXN_PER_CUST", "Avg Transactions per Customer")
+```
+
+```{r store88-ttest}
+trial_88  <- monthly %>% filter(STORE_NBR == 88, MONTH_YR >= TRIAL_START, MONTH_YR <= TRIAL_END) %>% pull(TOT_SALES)
+ctrl_88_s <- monthly %>% filter(STORE_NBR == ctrl_88, MONTH_YR >= TRIAL_START, MONTH_YR <= TRIAL_END) %>%
+               pull(TOT_SALES) * r88_sales$scale_factor
+
+cat("=== Store 88 vs Control", ctrl_88, "— Trial Period t-test (Total Sales) ===\n")
+t.test(trial_88, ctrl_88_s, paired = TRUE) %>% print()
+
+cat("\nTrial store monthly sales (trial period):", round(trial_88, 1), "\n")
+cat("Scaled control monthly sales (trial period):", round(ctrl_88_s, 1), "\n")
+cat("Uplift %:", round((mean(trial_88)/mean(ctrl_88_s) - 1)*100, 1), "%\n")
+```
+
+---
+
+# Summary Results Table
+
+```{r summary-table}
+results_summary <- tribble(
+  ~`Trial Store`, ~`Control Store`, ~`Sales Uplift (%)`, ~`Customer Uplift (%)`, ~`Significant?`,
+
+  77, ctrl_77,
+  round((mean(monthly %>% filter(STORE_NBR==77, MONTH_YR>=TRIAL_START, MONTH_YR<=TRIAL_END) %>% pull(TOT_SALES)) /
+         mean(monthly %>% filter(STORE_NBR==ctrl_77, MONTH_YR>=TRIAL_START, MONTH_YR<=TRIAL_END) %>% pull(TOT_SALES) * r77_sales$scale_factor) - 1)*100, 1),
+  round((mean(monthly %>% filter(STORE_NBR==77, MONTH_YR>=TRIAL_START, MONTH_YR<=TRIAL_END) %>% pull(N_CUSTOMERS)) /
+         mean(monthly %>% filter(STORE_NBR==ctrl_77, MONTH_YR>=TRIAL_START, MONTH_YR<=TRIAL_END) %>% pull(N_CUSTOMERS) * r77_cust$scale_factor) - 1)*100, 1),
+  "See t-test",
+
+  86, ctrl_86,
+  round((mean(monthly %>% filter(STORE_NBR==86, MONTH_YR>=TRIAL_START, MONTH_YR<=TRIAL_END) %>% pull(TOT_SALES)) /
+         mean(monthly %>% filter(STORE_NBR==ctrl_86, MONTH_YR>=TRIAL_START, MONTH_YR<=TRIAL_END) %>% pull(TOT_SALES) * r86_sales$scale_factor) - 1)*100, 1),
+  round((mean(monthly %>% filter(STORE_NBR==86, MONTH_YR>=TRIAL_START, MONTH_YR<=TRIAL_END) %>% pull(N_CUSTOMERS)) /
+         mean(monthly %>% filter(STORE_NBR==ctrl_86, MONTH_YR>=TRIAL_START, MONTH_YR<=TRIAL_END) %>% pull(N_CUSTOMERS) * r86_cust$scale_factor) - 1)*100, 1),
+  "See t-test",
+
+  88, ctrl_88,
+  round((mean(monthly %>% filter(STORE_NBR==88, MONTH_YR>=TRIAL_START, MONTH_YR<=TRIAL_END) %>% pull(TOT_SALES)) /
+         mean(monthly %>% filter(STORE_NBR==ctrl_88, MONTH_YR>=TRIAL_START, MONTH_YR<=TRIAL_END) %>% pull(TOT_SALES) * r88_sales$scale_factor) - 1)*100, 1),
+  round((mean(monthly %>% filter(STORE_NBR==88, MONTH_YR>=TRIAL_START, MONTH_YR<=TRIAL_END) %>% pull(N_CUSTOMERS)) /
+         mean(monthly %>% filter(STORE_NBR==ctrl_88, MONTH_YR>=TRIAL_START, MONTH_YR<=TRIAL_END) %>% pull(N_CUSTOMERS) * r88_cust$scale_factor) - 1)*100, 1),
+  "See t-test"
+)
+
+print(results_summary)
+```
+
+---
+
+# Conclusions & Recommendation to Julia
+
+## Key Findings
+
+**Store 77**
+- Sales and customer counts during the trial were notably above the scaled control's 95% confidence band in at least one trial month
+- The uplift appears **customer-driven** — more unique shoppers visited, rather than existing customers buying more per trip (avg transactions per customer remained stable)
+
+**Store 86**
+- Trial store performance was broadly **within** the confidence interval of its scaled control during the trial months
+- The trial did **not** produce a statistically significant uplift for Store 86 — the intervention appears to have had minimal impact at this location
+
+**Store 88**
+- Trial store sales exceeded the scaled control's confidence band across the trial months
+- Like Store 77, the uplift is primarily **customer-driven** (increased unique customers) — avg transactions per customer did not materially change
+
+## Recommendation
+
+> **Stores 77 and 88 show a positive, customer-driven sales uplift during the trial.** The trial intervention (likely a layout or ranging change) attracted more customers, which translated into higher revenue. These stores are good candidates to roll out the change more broadly.
+>
+> **Store 86 showed no significant uplift.** Before rolling out the intervention to similar stores, investigate whether Store 86's catchment area, store format, or existing customer mix makes it structurally unsuited to this change.
+>
+> **Recommended next step:** Identify what characterises the catchment areas of Stores 77 and 88 vs Store 86 to target the rollout at stores most likely to respond positively.
