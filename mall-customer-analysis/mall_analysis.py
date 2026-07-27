@@ -6,7 +6,9 @@ customers by annual income and spending score so we can see which groups
 are worth targeting.
 """
 
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 from pathlib import Path
 from sklearn.cluster import KMeans
@@ -162,18 +164,37 @@ def label_clusters(df, cluster_col="Cluster"):
     return labels
 
 
-def plot_clusters(df, cluster_col, labels):
+def plot_clusters(df, cluster_col, labels, predict_fn):
+    """
+    predict_fn takes an array of raw [Income, SpendingScore] pairs and returns
+    predicted cluster ids. Used to shade the background by predicted cluster
+    so the boundaries between segments are visible, not just the points.
+    """
     fig, ax = plt.subplots(figsize=(9, 7))
     colors = [RED, DARK_RED, GREY, LIGHT_GREY, "#e74c3c", "#34495e"]
+    color_rgb = np.array([mcolors.to_rgb(c) for c in colors])
+
+    x_min, x_max = df["Income"].min() - 5, df["Income"].max() + 5
+    y_min, y_max = df["SpendingScore"].min() - 5, df["SpendingScore"].max() + 5
+    xx, yy = np.meshgrid(np.arange(x_min, x_max, 1.0), np.arange(y_min, y_max, 1.0))
+    grid_labels = predict_fn(np.c_[xx.ravel(), yy.ravel()]).reshape(xx.shape)
+    background = color_rgb[grid_labels % len(colors)]
+
+    ax.imshow(
+        background, extent=(x_min, x_max, y_min, y_max),
+        origin="lower", aspect="auto", alpha=0.15,
+    )
 
     for cluster_id, group in df.groupby(cluster_col):
         color = colors[int(cluster_id) % len(colors)]
         ax.scatter(
             group["Income"], group["SpendingScore"],
             label=labels.get(cluster_id, f"Cluster {cluster_id}"),
-            color=color, alpha=0.75, edgecolors="white", s=60,
+            color=color, alpha=0.85, edgecolors="white", s=60,
         )
 
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
     ax.set_xlabel("Annual income (k$)")
     ax.set_ylabel("Spending score")
     ax.set_title("Customer segments")
@@ -213,7 +234,8 @@ def main():
     age_group_analysis(df)
 
     features = df[["Income", "SpendingScore"]]
-    X_scaled = StandardScaler().fit_transform(features)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(features)
 
     inertias, silhouettes = pick_k(X_scaled)
 
@@ -224,7 +246,7 @@ def main():
     df["Cluster"] = km.fit_predict(X_scaled)
 
     labels = label_clusters(df)
-    plot_clusters(df, "Cluster", labels)
+    plot_clusters(df, "Cluster", labels, lambda X: km.predict(scaler.transform(X)))
     plot_gender_by_cluster(df, "Cluster")
     print_summary(df, "Cluster", labels)
 
