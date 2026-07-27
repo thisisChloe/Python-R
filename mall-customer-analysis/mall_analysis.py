@@ -143,13 +143,25 @@ def label_clusters(df, cluster_col="Cluster"):
     """
     Give each cluster a human-readable label based on its average income
     and spending score, relative to the dataset median.
+
+    With k=5 there are only four quadrant labels, so one cluster would
+    always collide. The cluster whose centroid sits closest to the grand
+    centroid (mean of all centroids) is labelled "Middle income, average
+    spend" before the quadrant logic runs, avoiding the duplicate.
     """
     summary = df.groupby(cluster_col)[["Income", "SpendingScore"]].mean()
     income_mid = df["Income"].median()
     spend_mid = df["SpendingScore"].median()
 
+    grand = summary.mean()
+    distances = ((summary - grand) ** 2).sum(axis=1) ** 0.5
+    middle_id = distances.idxmin()
+
     labels = {}
     for cluster_id, row in summary.iterrows():
+        if cluster_id == middle_id:
+            labels[cluster_id] = "Middle income, average spend"
+            continue
         high_income = row["Income"] >= income_mid
         high_spend = row["SpendingScore"] >= spend_mid
         if high_income and high_spend:
